@@ -5,19 +5,33 @@ from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
 import json
 import time
+import threading
 
-# Configurações do navegador
-chrome_options = Options()
-chrome_options.add_argument("--start-maximized")
+# Configurações globais
+OAB_INICIAL = 3901
+OAB_FINAL = 5000
+PREFIXO = "SP"
+NUM_THREADS = 24
+LOCK = threading.Lock()
+TODOS_PROCESSOS = []
 
-# Inicializa o driver
-driver = webdriver.Chrome(
-    service=Service(ChromeDriverManager().install()),
-    options=chrome_options
-)
+def setup_driver():
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-popup-blocking")
+    chrome_options.add_argument("--blink-settings=imagesEnabled=false")
+    chrome_options.page_load_strategy = 'eager'
 
-# Função para extrair dados dos processos
-def extrair_dados_processos(oab):
+    return webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=chrome_options
+    )
+
+def extrair_dados_processos(oab, driver):
     processos_pagina = []
     elementos_processos = driver.find_elements(By.CSS_SELECTOR, "div[id^='divProcesso']")
     
@@ -65,11 +79,10 @@ def extrair_dados_processos(oab):
     
     return processos_pagina
 
-# Função para pesquisar uma OAB específica
-def pesquisar_oab(oab):
+def pesquisar_oab(oab, driver):
     url = f"https://esaj.tjsp.jus.br/cpopg/search.do?conversationId=&cbPesquisa=NUMOAB&dadosConsulta.valorConsulta={oab}&cdForo=-1"
     driver.get(url)
-    time.sleep(0.86)  # Espera inicial
+    time.sleep(0.86)
     
     processos_oab = []
     
@@ -84,39 +97,62 @@ def pesquisar_oab(oab):
             time.sleep(0.2)
         
         print(f"OAB {oab} - Processando página {pagina}/{total_paginas}")
-        processos_pagina = extrair_dados_processos(oab)
+        processos_pagina = extrair_dados_processos(oab, driver)
         processos_oab.extend(processos_pagina)
     
     return processos_oab
 
-# Range de OABs a pesquisar
-oab_inicial = 100  # 077826SP
-oab_final = 300    # 077832SP
-prefixo = "SP"
-todos_processos = []
+def worker(oabs, thread_id):
+    print(f"Thread {thread_id} iniciando...")
+    driver = setup_driver()
+    processos_thread = []
+    
+    try:
+        for oab_num in oabs:
+            oab_formatada = f"{str(oab_num).zfill(6)}{PREFIXO}"
+            print(f"Thread {thread_id} pesquisando OAB {oab_formatada}")
+            
+            processos_encontrados = pesquisar_oab(oab_formatada, driver)
+            
+            if processos_encontrados:
+                print(f"Thread {thread_id}: Encontrados {len(processos_encontrados)} processos para OAB {oab_formatada}")
+                processos_thread.extend(processos_encontrados)
+            else:
+                print(f"Thread {thread_id}: Nenhum processo encontrado para OAB {oab_formatada}")
+        
+        with LOCK:
+            TODOS_PROCESSOS.extend(processos_thread)
+            
+    except Exception as e:
+        print(f"Erro na thread {thread_id}: {str(e)}")
+    finally:
+        driver.quit()
+        print(f"Thread {thread_id} finalizada")
 
-try:
-    for numero in range(oab_inicial, oab_final + 1):
-        oab_formatada = f"{str(numero).zfill(6)}{prefixo}"  # Formata com zeros à esquerda
-        print(f"\nIniciando pesquisa para OAB {oab_formatada}")
-        
-        processos_encontrados = pesquisar_oab(oab_formatada)
-        
-        if processos_encontrados:
-            print(f"Encontrados {len(processos_encontrados)} processos para OAB {oab_formatada}")
-            todos_processos.extend(processos_encontrados)
-        else:
-            print(f"Nenhum processo encontrado para OAB {oab_formatada}")
-        
-        # Limpa memória explicitamente (embora o Python faça garbage collection)
-        del processos_encontrados
+def main():
+    # Divide o range de OABs entre as threads
+    oabs_por_thread = (OAB_FINAL - OAB_INICIAL + 1) // NUM_THREADS
+    threads = []
     
-    # Salva todos os dados coletados em um arquivo JSON
-    with open('processos_tjsp_range.json', 'w', encoding='utf-8') as f:
-        json.dump(todos_processos, f, ensure_ascii=False, indent=4)
+    for i in range(NUM_THREADS):
+        start = OAB_INICIAL + i * oabs_por_thread
+        end = start + oabs_por_thread - 1 if i < NUM_THREADS - 1 else OAB_FINAL
+        oabs = range(start, end + 1)
+        
+        t = threading.Thread(target=worker, args=(oabs, i+1))
+        threads.append(t)
+        t.start()
     
-    print(f"\nProcesso concluído! Total de processos coletados: {len(todos_processos)}")
+    # Aguarda todas as threads terminarem
+    for t in threads:
+        t.join()
+    
+    # Salva os resultados
+    with open(f'processos_tjsp_OAB{OAB_INICIAL}_OAB{OAB_FINAL}.json', 'w', encoding='utf-8') as f:
+        json.dump(TODOS_PROCESSOS, f, ensure_ascii=False, indent=4)
+    
+    print(f"\nProcesso concluído! Total de processos coletados: {len(TODOS_PROCESSOS)}")
     print(f"Dados salvos em 'processos_tjsp_range.json'")
 
-finally:
-    driver.quit()
+if __name__ == "__main__":
+    main()
