@@ -3,16 +3,17 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
-import json
+import sqlite3
 import time
 import threading
 import os
 
 # Configurações globais
 PREFIXO = "SP"
-NUM_THREADS = 32
+NUM_THREADS = 12
 LOCK = threading.Lock()
-TAMANHO_LOTE = 1000  # Quantidade de OABs por arquivo
+DB_LOCK = threading.Lock()  # Separate lock for database operations
+TAMANHO_LOTE = 100  # Quantidade de OABs por lote
 DELAY_ENTRE_LOTES = 5  # Segundos entre lotes
 
 def setup_driver():
@@ -32,6 +33,35 @@ def setup_driver():
         options=chrome_options
     )
 
+def inicializar_banco():
+    with DB_LOCK:
+        try:
+            conn = sqlite3.connect("processos.db")
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS processos (
+                    oab TEXT,
+                    numero_processo TEXT,
+                    assunto TEXT,
+                    link_processo TEXT,
+                    data_recebimento TEXT,
+                    documents_url TEXT
+            )""")
+            conn.commit()
+            print("Banco de dados inicializado com sucesso.")
+        except Exception as e:
+            print(f"Erro ao inicializar banco: {str(e)}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
+
+def safe_extract(element, by, value, attr=None):
+    try:
+        found = element.find_element(by, value)
+        return found.get_attribute(attr) if attr else found.text.strip()
+    except:
+        return None
+
 def extrair_dados_processos(oab, driver):
     try:
         elementos = driver.find_elements(By.CSS_SELECTOR, "div[id^='divProcesso']")
@@ -41,12 +71,10 @@ def extrair_dados_processos(oab, driver):
             dados = {
                 "oab": oab,
                 "numero_processo": safe_extract(processo, By.CLASS_NAME, "nuProcesso"),
-                "advogado": safe_extract(processo, By.CSS_SELECTOR, "div.nomeParte"),
-                "classe_processo": safe_extract(processo, By.CLASS_NAME, "classeProcesso"),
-                "assunto": safe_extract(processo, By.CLASS_NAME, "assuntoPrincipalProcesso"),
+                "assunto": f"{safe_extract(processo, By.CLASS_NAME, 'assuntoPrincipalProcesso')} {safe_extract(processo, By.CLASS_NAME, 'classeProcesso')}",
                 "link_processo": safe_extract(processo, By.CSS_SELECTOR, "a.linkProcesso", attr="href")
             }
-            
+
             data_local = safe_extract(processo, By.CLASS_NAME, "dataLocalDistribuicaoProcesso")
             if data_local:
                 parts = data_local.split(" - ", 1)
@@ -63,52 +91,59 @@ def extrair_dados_processos(oab, driver):
         print(f"Erro ao extrair processos para OAB {oab}: {str(e)}")
         return []
 
-def safe_extract(element, by, value, attr=None):
-    try:
-        found = element.find_element(by, value)
-        return found.get_attribute(attr) if attr else found.text.strip()
-    except:
-        return None
-
 def pesquisar_oab(oab, driver):
     try:
         url = f"https://esaj.tjsp.jus.br/cpopg/search.do?conversationId=&cbPesquisa=NUMOAB&dadosConsulta.valorConsulta={oab}&cdForo=-1"
         driver.get(url)
-        time.sleep(0.5)  # Delay reduzido
-        
+        time.sleep(0.5)
+
         processos = extrair_dados_processos(oab, driver)
         
-        # Verifica paginação
+        # Debug output
+        print(f"Encontrados {len(processos)} processos para OAB {oab}")
+        if processos:
+            print("Exemplo de processo encontrado:", processos[0])
+        
+        # Paginação
         paginas = driver.find_elements(By.CSS_SELECTOR, "a.paginacao")
         
         for pagina in range(2, len(paginas) + 2):
             url_pagina = f"{url}&paginaConsulta={pagina}"
             driver.get(url_pagina)
             time.sleep(0.2)
-            processos.extend(extrair_dados_processos(oab, driver))
+            novos_processos = extrair_dados_processos(oab, driver)
+            processos.extend(novos_processos)
         
         return processos
     except Exception as e:
         print(f"Erro ao pesquisar OAB {oab}: {str(e)}")
         return []
 
-def worker(oabs, thread_id, resultados):
+def worker(oabs, thread_id):
     driver = setup_driver()
     
     try:
         for oab_num in oabs:
             oab_formatada = f"{str(oab_num).zfill(6)}{PREFIXO}"
-            processos = pesquisar_oab(oab_formatada, driver)
+            print(f"Thread {thread_id} processando OAB {oab_formatada}...")
             
-            with LOCK:
-                resultados.extend(processos)
+            try:
+                processos = pesquisar_oab(oab_formatada, driver)
                 
-            print(f"Thread {thread_id} concluiu OAB {oab_formatada} - {len(processos)} processos")
+                # Salva imediatamente após cada pesquisa
+                if processos:
+                    with DB_LOCK:
+                        salvar_resultados(processos)
+                        print(f"Thread {thread_id} salvou {len(processos)} processos para OAB {oab_formatada}")
+                
+            except Exception as e:
+                print(f"Erro ao processar OAB {oab_formatada} na thread {thread_id}: {str(e)}")
+                continue
+                
     finally:
         driver.quit()
 
 def processar_lote(inicio, fim):
-    todos_processos = []
     oabs_por_thread = (fim - inicio + 1) // NUM_THREADS
     threads = []
     
@@ -117,42 +152,70 @@ def processar_lote(inicio, fim):
         end = start + oabs_por_thread - 1 if i < NUM_THREADS - 1 else fim
         oabs = range(start, end + 1)
         
-        t = threading.Thread(target=worker, args=(oabs, i+1, todos_processos))
+        t = threading.Thread(target=worker, args=(oabs, i + 1))
         threads.append(t)
         t.start()
     
     for t in threads:
         t.join()
-    
-    return todos_processos
 
-def salvar_resultados(resultados, inicio, fim):
-    nome_arquivo = f"processos_OAB{str(inicio).zfill(6)}_OAB{str(fim).zfill(6)}.json"
-    caminho = os.path.join("./processos", nome_arquivo)
-    
-    os.makedirs("./processos", exist_ok=True)
-    
-    with open(caminho, 'w', encoding='utf-8') as f:
-        json.dump(resultados, f, ensure_ascii=False, indent=2)
-    
-    print(f"\nArquivo salvo: {caminho} - {len(resultados)} processos")
+def salvar_resultados(resultados):
+    if not resultados:
+        return
+        
+    try:
+        conn = sqlite3.connect("processos.db")
+        cursor = conn.cursor()
+        
+        data_to_insert = []
+        for processo in resultados:
+            data_to_insert.append((
+                processo.get("oab"),
+                processo.get("numero_processo"),
+                processo.get("assunto"),
+                processo.get("link_processo"),
+                processo.get("data_recebimento")
+            ))
+        
+        cursor.executemany("""
+            INSERT OR IGNORE INTO processos (
+                oab,
+                numero_processo,
+                assunto,
+                link_processo,
+                data_recebimento
+            ) VALUES (?, ?, ?, ?, ?)
+        """, data_to_insert)
+        
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"Erro ao salvar no banco de dados: {str(e)}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 def main():
-    inicio = 18001  # Pode ser ajustado para continuar de onde parou
-    fim_total = inicio + 20000  # Total desejado
-    
+    print("Iniciando processo de scraping...")
+    inicializar_banco()
+    inicio = 18001
+    fim_total = inicio + 200
+
     while inicio <= fim_total:
         fim_lote = min(inicio + TAMANHO_LOTE - 1, fim_total)
         print(f"\nProcessando lote: OAB{inicio} a OAB{fim_lote}")
-        
+
         resultados = processar_lote(inicio, fim_lote)
-        salvar_resultados(resultados, inicio, fim_lote)
         
+        # Debug output
+        print(f"\nResumo do lote {inicio}-{fim_lote}:")
+
         inicio = fim_lote + 1
-        
+
         if inicio <= fim_total:
             print(f"\nAguardando {DELAY_ENTRE_LOTES} segundos antes do próximo lote...")
             time.sleep(DELAY_ENTRE_LOTES)
+
+    print("\nProcesso de scraping concluído.")
 
 if __name__ == "__main__":
     main()
